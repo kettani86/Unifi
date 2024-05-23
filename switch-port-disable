@@ -1,0 +1,112 @@
+<#
+.DESCRIPTION
+This PowerShell script is designed to manage UniFi switch ports via the UniFi Controller API. It allows users to authenticate with the UniFi Controller, retrieve device information, deactivate a specified port, and log out to clean up the session.
+
+.EXPLANATION
+1. **Authentication**: The script authenticates with the UniFi Controller using provided credentials (username and password) to obtain a session and CSRF token.
+2. **Device Information Retrieval**: It retrieves information about the specified device (identified by its MAC address) from the UniFi Controller.
+3. **Port Deactivation**: The script finds the specified port (identified by its index) on the device and deactivates it by enabling port security.
+4. **Update Device Configuration**: The new port settings are applied to the device by updating the device configuration on the UniFi Controller.
+5. **Session Cleanup**: Finally, the script logs out of the session to clean up.
+#>
+
+# Define the UniFi Controller URL and credentials
+$controllerUrl = 'https://controller.example.com:443'
+$username = 'username'
+$password = 'password'
+$site = 'default'  # Site name, usually 'default' for most installations
+$switchMac = '00:11:22:33:44:55'
+$portIndex = 5  # Example port index to deactivate
+
+# Bypass SSL certificate validation
+add-type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
+        return true;
+    }
+}
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+
+# Function to authenticate with the UniFi Controller
+function Invoke-UniFiLogin {
+    param (
+        [string]$ControllerUrl,
+        [string]$Username,
+        [string]$Password
+    )
+    
+    $loginUri = "$ControllerUrl/api/auth/login"
+    $loginBody = @{
+        username = $Username
+        password = $Password
+    } | ConvertTo-Json
+    
+    $response = Invoke-WebRequest -Uri $loginUri -Method Post -Body $loginBody -ContentType "application/json" -SessionVariable session
+    $csrfToken = $response.Headers['X-Csrf-Token']
+    return @{ Session = $session; CsrfToken = $csrfToken }
+}
+
+# Function to send a request to the UniFi API
+function Invoke-UniFiRequest {
+    param (
+        [string]$Uri,
+        [string]$Method = "Get",
+        [object]$Body = $null,
+        [object]$Headers = $null
+    )
+    
+    if ($Body) {
+        $Body = $Body | ConvertTo-Json -Depth 10
+    }
+
+    $response = Invoke-RestMethod -Uri $Uri -Method $Method -Body $Body -ContentType "application/json" -WebSession $session -Headers $Headers
+    return $response
+}
+
+# Authenticate and get the session and CSRF token
+$authResult = Invoke-UniFiLogin -ControllerUrl $controllerUrl -Username $username -Password $password
+$session = $authResult.Session
+$csrfToken = $authResult.CsrfToken
+
+# Get the device information
+$deviceUri = "$controllerUrl/proxy/network/api/s/$site/stat/device"
+$devices = Invoke-UniFiRequest -Uri $deviceUri -Headers @{ 'X-Csrf-Token' = $csrfToken }
+$device = $devices.data | Where-Object { $_.mac -eq $switchMac }
+
+if ($device) {
+    # Find the specific port and deactivate it
+    $portSettings = $device.port_table | Where-Object { $_.port_idx -eq $portIndex }
+
+    if ($portSettings) {
+        # Update port setting to disable it
+        $portSettings.port_security_enabled = $true
+        
+        # Create the port_overrides array, copying all properties except 'speed'
+        $portOverrides = @()
+        foreach ($port in $device.port_table) {
+            $portOverride = $port | Select-Object * -ExcludeProperty speed
+            $portOverrides += $portOverride
+        }
+
+        # Update the device with new port settings
+        $updateUri = "$controllerUrl/proxy/network/api/s/$site/rest/device/$($device._id)"
+        $updateBody = @{
+            port_overrides = $portOverrides
+        }
+        $response = Invoke-UniFiRequest -Uri $updateUri -Method Put -Body $updateBody -Headers @{ 'X-Csrf-Token' = $csrfToken }
+        Write-Host "Port $portIndex on device $($device.name) has been deactivated."
+    } else {
+        Write-Host "Port $portIndex not found on device $($device.name)."
+    }
+} else {
+    Write-Host "Device with MAC address $switchMac not found."
+}
+
+# Logout to clean up the session
+$logoutUri = "$controllerUrl/api/auth/logout"
+Invoke-RestMethod -Uri $logoutUri -Method Post -WebSession $session
